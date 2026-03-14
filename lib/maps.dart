@@ -1,8 +1,12 @@
+// ==========================================
+// 5. MAP SCREEN
+// ==========================================
 import 'dart:convert';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_map_location_marker/flutter_map_location_marker.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:blankmap_mobile/shared.dart';
@@ -15,160 +19,72 @@ class MapPin {
   final String id;
   final LatLng location;
   final String layer;
-  int upvotes;
-  int downvotes;
-
-  MapPin({
-    required this.id,
-    required this.location,
-    required this.layer,
-    this.upvotes = 1,
-    this.downvotes = 0,
-  });
+  MapPin({required this.id, required this.location, required this.layer});
 }
 
-// ==========================================
-// MAP SCREEN
-// ==========================================
 class MapScreen extends StatefulWidget {
-  final String activeLayer; // display name e.g. "r/Dustbins"
-  final String activeLayerId; // UUID from the API
-  final String token; // JWT
+  final String activeLayer;
   final Function(String) onLayerChanged;
-
   const MapScreen({
     super.key,
     required this.activeLayer,
-    required this.activeLayerId,
-    required this.token,
     required this.onLayerChanged,
   });
-
   @override
   State<MapScreen> createState() => _MapScreenState();
 }
 
 class _MapScreenState extends State<MapScreen> {
   final MapController _mapCtrl = MapController();
+  final _storage = const FlutterSecureStorage();
+
   LatLng _userLoc = const LatLng(28.6315, 77.2167);
   bool _locLoaded = false;
-  bool _pinning = false;
-  bool _loadingPins = false;
 
-  // Instance list — no longer static so pins reload per layer
   List<MapPin> _pins = [];
+  bool _pinsLoading = false;
 
-  final List<String> _quickLayers = allBlankMaps
-      .take(6)
-      .map((m) => m['tag'] as String)
-      .toList();
+  final Map<String, String> _layerNameToId = {};
 
   @override
   void initState() {
     super.initState();
     _initLoc();
-    if (widget.activeLayerId.isNotEmpty) _loadPins();
+    _loadBlankMapIds().then((_) => _fetchPins());
   }
 
-  // Reload pins whenever the active layer changes
   @override
   void didUpdateWidget(MapScreen old) {
     super.didUpdateWidget(old);
-    if (old.activeLayerId != widget.activeLayerId &&
-        widget.activeLayerId.isNotEmpty) {
-      _loadPins();
-    }
+    if (old.activeLayer != widget.activeLayer) _fetchPins();
   }
 
-  // ── API: load existing pins for the active layer ──────────────────────────
-  Future<void> _loadPins() async {
-    setState(() => _loadingPins = true);
+  Future<String?> _getToken() => _storage.read(key: 'jwt');
+
+  // ── Resolve layer name → blank-map UUID ─────────────────────────────────
+  Future<void> _loadBlankMapIds() async {
     try {
+      final token = await _getToken();
       final res = await http.get(
-        Uri.parse('$baseUrl/pins?blank_map_id=${widget.activeLayerId}'),
-        headers: {
-          'Authorization': 'Bearer ${widget.token}',
-          'Content-Type': 'application/json',
-        },
+        Uri.parse('$baseUrl/blank-maps'),
+        headers: {'Authorization': 'Bearer $token'},
       );
-
       if (res.statusCode == 200) {
-        final List<dynamic> data = jsonDecode(res.body);
-        setState(() {
-          _pins = data.map((p) {
-            return MapPin(
-              id: p['id']?.toString() ?? '',
-              location: LatLng(
-                (p['latitude'] as num).toDouble(),
-                (p['longitude'] as num).toDouble(),
-              ),
-              layer: widget.activeLayer,
-            );
-          }).toList();
-        });
-      } else {
-        debugPrint('Load pins error: ${res.body}');
+        final data = jsonDecode(res.body) as List;
+        for (final m in data) {
+          final name = (m['name'] ?? m['tag'] ?? '') as String;
+          final id = (m['id'] ?? '') as String;
+          if (name.isNotEmpty && id.isNotEmpty) _layerNameToId[name] = id;
+        }
       }
     } catch (e) {
-      debugPrint('Load pins exception: $e');
-    } finally {
-      if (mounted) setState(() => _loadingPins = false);
+      debugPrint('Load blank-map IDs error: $e');
     }
   }
 
-  // ── API: drop a new pin ───────────────────────────────────────────────────
-  Future<void> _dropPin() async {
-    if (_pinning) return;
-    if (widget.activeLayerId.isEmpty) {
-      _toast('Select a BlankMap layer first', isError: true);
-      return;
-    }
+  String? get _activeBlankMapId => _layerNameToId[widget.activeLayer];
 
-    setState(() => _pinning = true);
-    final center = _mapCtrl.camera.center;
-
-    try {
-      final res = await http.post(
-        Uri.parse('$baseUrl/pins'),
-        headers: {
-          'Authorization': 'Bearer ${widget.token}',
-          'Content-Type': 'application/json',
-        },
-        body: jsonEncode({
-          'name': widget.activeLayer,
-          'blank_map_id': widget.activeLayerId,
-          'latitude': center.latitude,
-          'longitude': center.longitude,
-        }),
-      );
-
-      if (res.statusCode == 201) {
-        final data = jsonDecode(res.body);
-        setState(() {
-          _pins.add(
-            MapPin(
-              id:
-                  data['id']?.toString() ??
-                  DateTime.now().millisecondsSinceEpoch.toString(),
-              location: center,
-              layer: widget.activeLayer,
-            ),
-          );
-        });
-        _toast('Pinned to ${widget.activeLayer}  ·  +10 Karma');
-      } else {
-        debugPrint('Pin error: ${res.body}');
-        _toast('Failed to drop pin', isError: true);
-      }
-    } catch (e) {
-      debugPrint('Pin exception: $e');
-      _toast('Network error', isError: true);
-    } finally {
-      if (mounted) setState(() => _pinning = false);
-    }
-  }
-
-  // ── Location ──────────────────────────────────────────────────────────────
+  // ── Location ─────────────────────────────────────────────────────────────
   Future<void> _initLoc() async {
     try {
       bool svcOn = await Geolocator.isLocationServiceEnabled();
@@ -179,7 +95,6 @@ class _MapScreenState extends State<MapScreen> {
         if (perm == LocationPermission.denied) return;
       }
       if (perm == LocationPermission.deniedForever) return;
-
       final pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
       );
@@ -194,8 +109,124 @@ class _MapScreenState extends State<MapScreen> {
     } catch (_) {}
   }
 
+  // ── Fetch pins ────────────────────────────────────────────────────────────
+  Future<void> _fetchPins() async {
+    final mapId = _activeBlankMapId;
+    if (mapId == null || mapId.isEmpty) return;
+    setState(() => _pinsLoading = true);
+    try {
+      final token = await _getToken();
+      final uri = Uri.parse(
+        '$baseUrl/pins',
+      ).replace(queryParameters: {'blank_map_id': mapId});
+      final res = await http.get(
+        uri,
+        headers: {'Authorization': 'Bearer $token'},
+      );
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body) as List;
+        final pins = data
+            .map(
+              (json) => MapPin(
+                id: json['id'] as String,
+                location: LatLng(
+                  (json['latitude'] as num).toDouble(),
+                  (json['longitude'] as num).toDouble(),
+                ),
+                layer: widget.activeLayer,
+              ),
+            )
+            .toList();
+        if (mounted) setState(() => _pins = pins);
+      }
+    } catch (e) {
+      debugPrint('Fetch pins exception: $e');
+    } finally {
+      if (mounted) setState(() => _pinsLoading = false);
+    }
+  }
+
+  // ── Drop pin ──────────────────────────────────────────────────────────────
+  void _dropPin() async {
+    final mapId = _activeBlankMapId;
+    if (mapId == null || mapId.isEmpty) {
+      _toast('Select a map layer first');
+      return;
+    }
+    final center = _mapCtrl.camera.center;
+    try {
+      final token = await _getToken();
+      final res = await http.post(
+        Uri.parse('$baseUrl/pins'),
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({
+          'name': 'Pin on ${widget.activeLayer}',
+          'blank_map_id': mapId,
+          'latitude': center.latitude,
+          'longitude': center.longitude,
+        }),
+      );
+      if (res.statusCode == 200 || res.statusCode == 201) {
+        final json = jsonDecode(res.body) as Map<String, dynamic>;
+        final newPin = MapPin(
+          id: json['id'] as String,
+          location: LatLng(
+            (json['latitude'] as num).toDouble(),
+            (json['longitude'] as num).toDouble(),
+          ),
+          layer: widget.activeLayer,
+        );
+        if (mounted) setState(() => _pins.add(newPin));
+        _toast('Pinned to ${widget.activeLayer}  ·  +10 Karma');
+      } else {
+        _toast('Failed to drop pin');
+      }
+    } catch (e) {
+      _toast('Failed to drop pin');
+    }
+  }
+
+  // ── POST /feedback  { pin_id, rating: 1–5 } ──────────────────────────────
+  Future<void> _submitRating(String pinId, int rating) async {
+    try {
+      final token = await _getToken();
+      await http.post(
+        Uri.parse('$baseUrl/feedback'),
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json',
+        },
+        body: jsonEncode({'pin_id': pinId, 'rating': rating}),
+      );
+    } catch (e) {
+      debugPrint('Submit rating error: $e');
+    }
+  }
+
+  // ── Delete pin ────────────────────────────────────────────────────────────
+  Future<void> _deletePin(MapPin pin) async {
+    try {
+      final token = await _getToken();
+      final res = await http.delete(
+        Uri.parse('$baseUrl/pins/${pin.id}'),
+        headers: {'Authorization': 'Bearer $token'},
+      );
+      if (res.statusCode == 200 || res.statusCode == 204) {
+        if (mounted) setState(() => _pins.remove(pin));
+        _toast('Pin removed');
+      } else {
+        _toast('Failed to remove pin');
+      }
+    } catch (e) {
+      _toast('Failed to remove pin');
+    }
+  }
+
   // ── Toast ─────────────────────────────────────────────────────────────────
-  void _toast(String msg, {bool isError = false}) {
+  void _toast(String msg) {
     showCupertinoDialog(
       context: context,
       barrierDismissible: true,
@@ -216,11 +247,9 @@ class _MapScreenState extends State<MapScreen> {
             mainAxisSize: MainAxisSize.min,
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(
-                isError
-                    ? CupertinoIcons.xmark_circle_fill
-                    : CupertinoIcons.checkmark_circle_fill,
-                color: isError ? BM.danger : BM.accent,
+              const Icon(
+                CupertinoIcons.checkmark_circle_fill,
+                color: BM.accent,
                 size: 18,
               ),
               const SizedBox(width: 8),
@@ -244,176 +273,147 @@ class _MapScreenState extends State<MapScreen> {
     });
   }
 
-  // ── Pin detail sheet ──────────────────────────────────────────────────────
+  // ── Pin sheet ─────────────────────────────────────────────────────────────
   void _showPinSheet(MapPin pin) {
     showCupertinoModalPopup(
       context: context,
       builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setSheet) => Container(
-          margin: const EdgeInsets.fromLTRB(10, 0, 10, 10),
-          padding: const EdgeInsets.fromLTRB(22, 18, 22, 32),
-          decoration: BoxDecoration(
-            color: BM.surface,
-            borderRadius: BorderRadius.circular(26),
-            border: Border.all(color: BM.border),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                width: 36,
-                height: 4,
-                margin: const EdgeInsets.only(bottom: 18),
-                decoration: BoxDecoration(
-                  color: BM.border,
-                  borderRadius: BorderRadius.circular(2),
-                ),
-              ),
-              Container(
-                width: 54,
-                height: 54,
-                decoration: BoxDecoration(
-                  color: BM.accentSoft,
-                  borderRadius: BorderRadius.circular(17),
-                  border: Border.all(color: BM.accent.withOpacity(0.35)),
-                ),
-                child: const Icon(
-                  CupertinoIcons.location_solid,
-                  color: BM.accent,
-                  size: 38,
-                  shadows: [Shadow(color: Colors.black54, blurRadius: 10)],
-                ),
-              ),
-              const SizedBox(height: 14),
-              Text(
-                pin.layer,
-                style: const TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w800,
-                  color: BM.textPri,
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                '${pin.location.latitude.toStringAsFixed(5)}, '
-                '${pin.location.longitude.toStringAsFixed(5)}',
-                style: const TextStyle(color: BM.textTer, fontSize: 11),
-              ),
-              const SizedBox(height: 10),
-              Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 14,
-                  vertical: 5,
-                ),
-                decoration: BoxDecoration(
-                  color: BM.success.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: BM.success.withOpacity(0.3)),
-                ),
-                child: const Text(
-                  '✓  Community Verified',
-                  style: TextStyle(
-                    color: BM.success,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
+        builder: (ctx, setSheet) {
+          int selectedStars = 0;
+          return Container(
+            margin: const EdgeInsets.fromLTRB(10, 0, 10, 10),
+            padding: const EdgeInsets.fromLTRB(22, 18, 22, 32),
+            decoration: BoxDecoration(
+              color: BM.surface,
+              borderRadius: BorderRadius.circular(26),
+              border: Border.all(color: BM.border),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                // Handle
+                Container(
+                  width: 36,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 18),
+                  decoration: BoxDecoration(
+                    color: BM.border,
+                    borderRadius: BorderRadius.circular(2),
                   ),
                 ),
-              ),
-              const SizedBox(height: 24),
-              Row(
-                children: [
-                  Expanded(
-                    child: GestureDetector(
+                // Icon
+                Container(
+                  width: 54,
+                  height: 54,
+                  decoration: BoxDecoration(
+                    color: BM.accentSoft,
+                    borderRadius: BorderRadius.circular(17),
+                    border: Border.all(color: BM.accent.withOpacity(0.35)),
+                  ),
+                  child: const Icon(
+                    CupertinoIcons.location_solid,
+                    color: BM.accent,
+                    size: 38,
+                    shadows: [Shadow(color: Colors.black54, blurRadius: 10)],
+                  ),
+                ),
+                const SizedBox(height: 14),
+                Text(
+                  pin.layer,
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800,
+                    color: BM.textPri,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '${pin.location.latitude.toStringAsFixed(5)}, '
+                  '${pin.location.longitude.toStringAsFixed(5)}',
+                  style: const TextStyle(color: BM.textTer, fontSize: 11),
+                ),
+                const SizedBox(height: 28),
+
+                // ── 5 Stars ────────────────────────────────────────────
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: List.generate(5, (i) {
+                    final filled = i < selectedStars;
+                    return GestureDetector(
                       onTap: () {
-                        setSheet(() => pin.upvotes++);
-                        setState(() {});
-                        Navigator.pop(ctx);
+                        setSheet(() => selectedStars = i + 1);
+                        _submitRating(pin.id, i + 1);
+                        Future.delayed(const Duration(milliseconds: 500), () {
+                          if (ctx.mounted) Navigator.pop(ctx);
+                          _toast('Thanks for rating!');
+                        });
                       },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(vertical: 15),
-                        decoration: BoxDecoration(
-                          color: BM.success.withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(15),
-                          border: Border.all(
-                            color: BM.success.withOpacity(0.3),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 6),
+                        child: Icon(
+                          filled
+                              ? CupertinoIcons.star_fill
+                              : CupertinoIcons.star,
+                          color: filled ? const Color(0xFFFFC107) : BM.textTer,
+                          size: 38,
+                        ),
+                      ),
+                    );
+                  }),
+                ),
+                const SizedBox(height: 28),
+
+                // ── Delete ────────────────────────────────────────────
+                GestureDetector(
+                  onTap: () {
+                    Navigator.pop(ctx);
+                    _deletePin(pin);
+                  },
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 13),
+                    decoration: BoxDecoration(
+                      color: BM.danger.withOpacity(0.08),
+                      borderRadius: BorderRadius.circular(15),
+                      border: Border.all(color: BM.danger.withOpacity(0.25)),
+                    ),
+                    child: const Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Icon(CupertinoIcons.trash, color: BM.danger, size: 15),
+                        SizedBox(width: 8),
+                        Text(
+                          'Remove Pin',
+                          style: TextStyle(
+                            color: BM.danger,
+                            fontWeight: FontWeight.w600,
+                            fontSize: 13,
                           ),
                         ),
-                        child: Column(
-                          children: [
-                            const Icon(
-                              CupertinoIcons.hand_thumbsup_fill,
-                              color: BM.success,
-                              size: 22,
-                            ),
-                            const SizedBox(height: 6),
-                            Text(
-                              '${pin.upvotes}  Works',
-                              style: const TextStyle(
-                                color: BM.success,
-                                fontWeight: FontWeight.w700,
-                                fontSize: 13,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
+                      ],
                     ),
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: GestureDetector(
-                      onTap: () {
-                        setSheet(() => pin.downvotes++);
-                        setState(() {});
-                        Navigator.pop(ctx);
-                      },
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(vertical: 15),
-                        decoration: BoxDecoration(
-                          color: BM.danger.withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(15),
-                          border: Border.all(color: BM.danger.withOpacity(0.3)),
-                        ),
-                        child: Column(
-                          children: [
-                            const Icon(
-                              CupertinoIcons.hand_thumbsdown_fill,
-                              color: BM.danger,
-                              size: 22,
-                            ),
-                            const SizedBox(height: 6),
-                            Text(
-                              '${pin.downvotes}  Broken',
-                              style: const TextStyle(
-                                color: BM.danger,
-                                fontWeight: FontWeight.w700,
-                                fontSize: 13,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
+                ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
 
-  // ── Build ─────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
+    final activePins = _pins
+        .where((p) => p.layer == widget.activeLayer)
+        .toList();
     final topPad = MediaQuery.of(context).padding.top;
 
     return CupertinoPageScaffold(
       backgroundColor: BM.bg,
       child: Stack(
         children: [
-          // ── MAP ──────────────────────────────────
+          // ── MAP ──────────────────────────────────────────────────────
           FlutterMap(
             mapController: _mapCtrl,
             options: MapOptions(initialCenter: _userLoc, initialZoom: 15.0),
@@ -438,7 +438,7 @@ class _MapScreenState extends State<MapScreen> {
                 ),
               ),
               MarkerLayer(
-                markers: _pins.map((pin) {
+                markers: activePins.map((pin) {
                   return Marker(
                     point: pin.location,
                     width: 44,
@@ -463,87 +463,21 @@ class _MapScreenState extends State<MapScreen> {
               ),
             ],
           ),
-
-          // ── CROSSHAIR ────────────────────────────
+          // ── CROSSHAIR ────────────────────────────────────────────────
           const Center(
             child: Icon(CupertinoIcons.plus, color: Colors.black54, size: 26),
           ),
-
-          // ── TOP GRADIENT + LAYER CHIPS ────────────
+          // ── LOCATE ME ────────────────────────────────────────────────
           Positioned(
-            top: 0,
-            left: 0,
-            right: 0,
-            child: Container(
-              padding: EdgeInsets.only(top: topPad + 8, bottom: 12),
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topCenter,
-                  end: Alignment.bottomCenter,
-                  colors: [BM.bg.withOpacity(0.96), BM.bg.withOpacity(0.0)],
-                  stops: const [0.35, 1.0],
-                ),
-              ),
-              child: SizedBox(
-                height: 38,
-                child: ListView.builder(
-                  scrollDirection: Axis.horizontal,
-                  padding: const EdgeInsets.symmetric(horizontal: 14),
-                  itemCount: _quickLayers.length,
-                  itemBuilder: (_, i) {
-                    final l = _quickLayers[i];
-                    final sel = l == widget.activeLayer;
-                    return GestureDetector(
-                      onTap: () => widget.onLayerChanged(l),
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 180),
-                        margin: const EdgeInsets.only(right: 8),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 7,
-                        ),
-                        decoration: BoxDecoration(
-                          color: sel ? BM.accent : BM.surface,
-                          borderRadius: BorderRadius.circular(22),
-                          border: Border.all(
-                            color: sel ? BM.accent : BM.border,
-                          ),
-                          boxShadow: sel
-                              ? [
-                                  BoxShadow(
-                                    color: BM.accentGlow,
-                                    blurRadius: 12,
-                                  ),
-                                ]
-                              : [],
-                        ),
-                        child: Text(
-                          l,
-                          style: TextStyle(
-                            color: sel ? BM.bg : BM.textSec,
-                            fontSize: 12,
-                            fontWeight: sel ? FontWeight.w700 : FontWeight.w500,
-                          ),
-                        ),
-                      ),
-                    );
-                  },
-                ),
-              ),
-            ),
-          ),
-
-          // ── LOCATE ME ────────────────────────────
-          Positioned(
-            top: topPad + 58,
-            right: 14,
+            bottom: 85,
+            right: 20,
             child: GestureDetector(
               onTap: () {
                 if (_locLoaded) _mapCtrl.move(_userLoc, 16.0);
               },
               child: Container(
-                width: 42,
-                height: 42,
+                width: 50,
+                height: 50,
                 decoration: BoxDecoration(
                   color: BM.surface,
                   borderRadius: BorderRadius.circular(13),
@@ -565,83 +499,39 @@ class _MapScreenState extends State<MapScreen> {
               ),
             ),
           ),
-
-          // ── PIN COUNT BADGE ───────────────────────
-          if (_pins.isNotEmpty)
+          // ── PINS LOADING ──────────────────────────────────────────────
+          if (_pinsLoading)
             Positioned(
               top: topPad + 58,
               left: 14,
               child: Container(
                 padding: const EdgeInsets.symmetric(
                   horizontal: 12,
-                  vertical: 7,
+                  vertical: 8,
                 ),
                 decoration: BoxDecoration(
                   color: BM.surface,
-                  borderRadius: BorderRadius.circular(13),
+                  borderRadius: BorderRadius.circular(20),
                   border: Border.all(color: BM.border),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.3),
-                      blurRadius: 10,
-                    ),
-                  ],
                 ),
-                child: Row(
+                child: const Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(
-                      CupertinoIcons.location_solid,
-                      color: BM.accent,
-                      size: 13,
-                    ),
-                    const SizedBox(width: 5),
+                    CupertinoActivityIndicator(color: BM.accent, radius: 7),
+                    SizedBox(width: 8),
                     Text(
-                      '${_pins.length} pins',
-                      style: const TextStyle(
-                        color: BM.textPri,
+                      'Loading pins...',
+                      style: TextStyle(
+                        color: BM.textSec,
                         fontSize: 12,
-                        fontWeight: FontWeight.w600,
+                        fontWeight: FontWeight.w500,
                       ),
                     ),
                   ],
                 ),
               ),
             ),
-
-          // ── PINS LOADING INDICATOR ────────────────
-          if (_loadingPins)
-            Positioned(
-              top: topPad + 58,
-              left: 0,
-              right: 0,
-              child: Center(
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 9,
-                  ),
-                  decoration: BoxDecoration(
-                    color: BM.surface,
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: BM.border),
-                  ),
-                  child: const Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      CupertinoActivityIndicator(color: BM.accent, radius: 8),
-                      SizedBox(width: 8),
-                      Text(
-                        'Loading pins...',
-                        style: TextStyle(color: BM.textSec, fontSize: 12),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-
-          // ── GPS LOADING ───────────────────────────
+          // ── GPS LOADING ───────────────────────────────────────────────
           if (!_locLoaded)
             Positioned(
               bottom: 110,
@@ -676,18 +566,17 @@ class _MapScreenState extends State<MapScreen> {
                 ),
               ),
             ),
-
-          // ── DROP PIN BUTTON ───────────────────────
+          // ── DROP PIN BUTTON ───────────────────────────────────────────
           Positioned(
             bottom: 20,
             left: 18,
             right: 18,
             child: GestureDetector(
-              onTap: _pinning ? null : _dropPin,
+              onTap: _dropPin,
               child: Container(
                 padding: const EdgeInsets.symmetric(vertical: 16),
                 decoration: BoxDecoration(
-                  color: _pinning ? BM.accent.withOpacity(0.6) : BM.accent,
+                  color: BM.accent,
                   borderRadius: BorderRadius.circular(20),
                   boxShadow: [
                     BoxShadow(
@@ -700,17 +589,14 @@ class _MapScreenState extends State<MapScreen> {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    if (_pinning)
-                      const CupertinoActivityIndicator(color: BM.bg, radius: 9)
-                    else
-                      const Icon(
-                        CupertinoIcons.location_fill,
-                        color: BM.bg,
-                        size: 18,
-                      ),
+                    const Icon(
+                      CupertinoIcons.location_fill,
+                      color: BM.bg,
+                      size: 18,
+                    ),
                     const SizedBox(width: 10),
                     Text(
-                      _pinning ? 'Saving...' : 'Pin to ${widget.activeLayer}',
+                      'Pin to ${widget.activeLayer}',
                       style: const TextStyle(
                         color: BM.bg,
                         fontSize: 15,

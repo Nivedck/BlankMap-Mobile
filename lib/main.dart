@@ -80,8 +80,8 @@ class _MainNavState extends State<MainNav> {
     final List<Widget> pages = [
       MapScreen(
         activeLayer: _activeLayer,
-        activeLayerId: _activeLayerId,
-        token: _token,
+        // activeLayerId: _activeLayerId,
+        // token: _token,
         onLayerChanged: (name) => setState(() => _activeLayer = name),
       ),
       BlankMapsScreen(onTagSelected: _goToMap),
